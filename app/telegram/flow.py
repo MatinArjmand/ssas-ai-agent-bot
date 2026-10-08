@@ -1,22 +1,21 @@
-"""Conversation flow, independent of Telegram so it can be tested offline."""
+"""Telegram-independent conversation flow with per-email database scoping."""
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from datetime import datetime
+import hashlib
 import logging
 from pathlib import Path
 import secrets
 from typing import Awaitable, Callable
 
-from agent_service import AgentService
-from bot_config import Catalog, ConfigError, Database, DatabaseTarget, load_catalog
-
+from ..agent_service import AgentService
+from ..config import Catalog, ConfigError, Database, DatabaseTarget, load_catalog
 
 logger = logging.getLogger(__name__)
 PAGE_SIZE = 8
-Choices = list[tuple[str, str]]  # (button label, opaque callback data)
+Choices = list[tuple[str, str]]
 Send = Callable[[str, Choices | None], Awaitable[None]]
 
 
@@ -52,19 +51,19 @@ class Session:
         self.clear_pending()
 
 
-def combine_question(database: Database, target: DatabaseTarget, question: str,
-                     period: str, now: datetime | None = None) -> str:
+def compose_request(database: Database, target: DatabaseTarget, question: str, period: str | None = None,
+                    now: datetime | None = None) -> str:
     now = now or datetime.now().astimezone()
-    return (
-        f"Selected database: {database.name}\n"
-        f"Database catalog: {target.catalog}\n"
-        f"Question: {question}\n"
-        f"Date period: {period}\n"
-        f"Reference date: {now.date().isoformat()} "
-        f"(bot computer local time, UTC offset {now.strftime('%z')}).\n"
-        "Answer the question for this date period using the selected database schema. "
-        "Resolve relative periods against the reference date."
-    )
+    parts = [
+        f"Question: {question}",
+        f"Reference date: {now.date().isoformat()} (application local time, UTC offset {now.strftime('%z')}).",
+    ]
+    if period is not None:
+        parts.insert(1, f"Date period: {period}")
+        parts.append("Resolve relative date periods against the reference date.")
+    else:
+        parts.append("No separate date-period menu value was selected; follow any date wording in the question itself.")
+    return "\n".join(parts)
 
 
 class BotFlow:
@@ -72,18 +71,32 @@ class BotFlow:
         self.config_path = config_path
         self.backend = backend
 
-    async def _catalog(self, state: Session, send: Send) -> Catalog | None:
+    async def _catalog(self, state: Session, send: Send, allowed_database_ids: frozenset[str]) -> Catalog | None:
         try:
-            return load_catalog(self.config_path)
+            full = load_catalog(self.config_path)
         except ConfigError:
             logger.exception("Invalid database menu configuration")
             state.reset()
             await send("The database options are temporarily unavailable. Please contact the bot administrator.", None)
             return None
+        filtered = full.permitted(allowed_database_ids)
+        # Permission changes invalidate old inline buttons even when databases.json did not change.
+        permission_hash = hashlib.sha256(
+            (full.revision + "|" + "|".join(sorted(allowed_database_ids))).encode("utf-8")
+        ).hexdigest()
+        filtered = Catalog(permission_hash, filtered.databases)
+        if not filtered.databases:
+            state.reset()
+            await send(
+                "Your account is registered, but no enabled databases are assigned to your email. "
+                "Please contact the administrator.",
+                None,
+            )
+            return None
+        return filtered
 
-    async def _menu(self, state: Session, catalog: Catalog, send: Send,
-                    text: str, items: list[tuple[str, Action]],
-                    page_kind: str, page: int = 0,
+    async def _menu(self, state: Session, catalog: Catalog, send: Send, text: str,
+                    items: list[tuple[str, Action]], page_kind: str, page: int = 0,
                     extras: list[tuple[str, Action]] | None = None):
         page_count = max(1, (len(items) + PAGE_SIZE - 1) // PAGE_SIZE)
         page = max(0, min(page, page_count - 1))
@@ -102,8 +115,7 @@ class BotFlow:
         await send(text, buttons or None)
         state.menu = menu
 
-    async def _databases(self, state: Session, catalog: Catalog, send: Send,
-                         prefix: str = "", page: int = 0):
+    async def _databases(self, state: Session, catalog: Catalog, send: Send, prefix: str = "", page: int = 0):
         state.reset()
         await self._menu(
             state, catalog, send,
@@ -112,18 +124,19 @@ class BotFlow:
             "database_page", page,
         )
 
-    async def _questions(self, state: Session, catalog: Catalog, database: Database,
-                         send: Send, prefix: str = "", page: int = 0):
+    async def _questions(self, state: Session, catalog: Catalog, database: Database, send: Send,
+                         prefix: str = "", page: int = 0):
         state.clear_pending()
         text = prefix + f"Selected database: {database.name}\n\n"
-        text += ("Choose a recommended question below, or type and send your own question."
-                 if database.questions else "Type and send your question.")
+        text += (
+            "Choose a recommended question below, or type and send your own question."
+            if database.questions else "Type and send your question."
+        )
         await self._menu(
             state, catalog, send, text,
             [(q.label, Action("question", i)) for i, q in enumerate(database.questions)],
             "question_page", page,
-            [("Ask my own question", Action("custom_question")),
-             ("Change database", Action("change_database"))],
+            [("Ask my own question", Action("custom_question")), ("Change database", Action("change_database"))],
         )
 
     async def _periods(self, state: Session, catalog: Catalog, database: Database,
@@ -135,40 +148,35 @@ class BotFlow:
             state, catalog, send,
             f"Database: {database.name}\nQuestion: {question.question}\n\n"
             "Choose a date period below, or type and send your own date period.\n"
-            "Example: 2026-01-01 to 2026-03-31.\n"
-            "Use /cancel to choose a different question.",
+            "Example: 2026-01-01 to 2026-03-31.\nUse /cancel to choose a different question.",
             [(period.label, Action("period", i)) for i, period in enumerate(question.date_periods)],
             "period_page", page,
-            [("Type my own date period", Action("custom_period")),
-             ("Back to questions", Action("questions"))],
+            [("Type my own date period", Action("custom_period")), ("Back to questions", Action("questions"))],
         )
 
-    async def _selected(self, state: Session, catalog: Catalog, send: Send
-                        ) -> tuple[Database, DatabaseTarget] | None:
+    async def _selected(self, state: Session, catalog: Catalog, send: Send) -> tuple[Database, DatabaseTarget] | None:
         database = catalog.get(state.database_id)
         if database is None:
-            await self._databases(state, catalog, send)
+            await self._databases(state, catalog, send, "Your database access changed. Please choose again.\n\n")
             return None
         try:
             target = database.target()
         except ConfigError:
             logger.exception("Invalid connection configuration for database %s", database.id)
-            await self._databases(state, catalog, send,
-                                  "That database needs administrator setup. Please choose a database.\n\n")
+            await self._databases(state, catalog, send, "That database needs administrator setup. Please choose another.\n\n")
             return None
         if target.identity != state.target_identity:
-            await self._databases(state, catalog, send,
-                                  "The database connection settings changed. Please select it again.\n\n")
+            await self._databases(state, catalog, send, "The database connection settings changed. Please select it again.\n\n")
             return None
         return database, target
 
-    async def start(self, state: Session, send: Send):
-        catalog = await self._catalog(state, send)
+    async def start(self, state: Session, send: Send, allowed_database_ids: frozenset[str]):
+        catalog = await self._catalog(state, send, allowed_database_ids)
         if catalog:
             await self._databases(state, catalog, send)
 
-    async def questions(self, state: Session, send: Send):
-        catalog = await self._catalog(state, send)
+    async def questions(self, state: Session, send: Send, allowed_database_ids: frozenset[str]):
+        catalog = await self._catalog(state, send, allowed_database_ids)
         if catalog:
             selected = await self._selected(state, catalog, send)
             if selected:
@@ -179,11 +187,13 @@ class BotFlow:
         await send(f"Connecting to {database.name}...", None)
         try:
             target = database.target()
-            await asyncio.to_thread(self.backend.connect, target)
-        except Exception:
+            await self.backend.connect(target)
+        except Exception:  # noqa: BLE001
             logger.exception("Cannot connect to database %s", database.id)
-            await self._databases(state, catalog, send,
-                                  f"I could not connect to {database.name}. Please try again or choose another database.\n\n")
+            await self._databases(
+                state, catalog, send,
+                f"I could not connect to {database.name}. Please try again or choose another database.\n\n",
+            )
             return
         state.database_id = database.id
         state.target_identity = target.identity
@@ -191,28 +201,22 @@ class BotFlow:
 
     async def _ask(self, state: Session, catalog: Catalog, database: Database,
                    target: DatabaseTarget, question: str, send: Send):
-        # Consume the old menu/date choice before doing any blocking work so a
-        # repeated callback cannot issue the same query twice.
         state.clear_pending()
-        await send(f"Checking {database.name}. Please wait...", None)
+        await send(f"Checking {database.name}...", None)
         try:
-            # Read examples from this interaction's catalog, independently of
-            # the cached schema, so saved DAX edits take effect on the next ask.
-            answer = await asyncio.to_thread(
-                self.backend.ask, target, question, knowledge_base=database.knowledge_base,
-            )
-        except Exception:
+            answer = await self.backend.ask(target, question, knowledge_base=database.knowledge_base)
+        except Exception:  # noqa: BLE001
             logger.exception("Agent failed for database %s", database.id)
             await send("I could not answer that question. Please try again or contact the bot administrator.", None)
         else:
             await send(str(answer).strip() or "The agent returned an empty answer.", None)
         await self._questions(state, catalog, database, send)
 
-    async def text(self, state: Session, text: str, send: Send):
+    async def text(self, state: Session, text: str, send: Send, allowed_database_ids: frozenset[str]):
         text = text.strip()
         if not text:
             return
-        catalog = await self._catalog(state, send)
+        catalog = await self._catalog(state, send, allowed_database_ids)
         if catalog is None:
             return
         selected = await self._selected(state, catalog, send)
@@ -221,18 +225,16 @@ class BotFlow:
         database, target = selected
         if state.pending_question is not None:
             if state.pending_revision != catalog.revision:
-                await self._questions(state, catalog, database, send,
-                                      "The recommended options changed. Please choose your question again.\n\n")
+                await self._questions(state, catalog, database, send, "The recommended options changed. Please choose again.\n\n")
                 return
             question = database.questions[state.pending_question]
-            prompt = combine_question(database, target, question.question, text)
+            prompt = compose_request(database, target, question.question, text)
         else:
-            # A typed message is a custom question even if it matches a button label.
-            prompt = text
+            prompt = compose_request(database, target, text)
         await self._ask(state, catalog, database, target, prompt, send)
 
-    async def callback(self, state: Session, data: str, send: Send):
-        catalog = await self._catalog(state, send)
+    async def callback(self, state: Session, data: str, send: Send, allowed_database_ids: frozenset[str]):
+        catalog = await self._catalog(state, send, allowed_database_ids)
         if catalog is None:
             return
         menu = state.menu
@@ -247,21 +249,21 @@ class BotFlow:
             return
         if menu.revision != catalog.revision:
             if state.database_id is None:
-                await self._databases(state, catalog, send, "The database options changed. Please choose again.\n\n")
+                await self._databases(state, catalog, send, "Your available options changed. Please choose again.\n\n")
             else:
                 selected = await self._selected(state, catalog, send)
                 if selected:
-                    await self._questions(state, catalog, selected[0], send,
-                                          "The recommended options changed. Please choose again.\n\n")
+                    await self._questions(state, catalog, selected[0], send, "Your available options changed. Please choose again.\n\n")
             return
         state.menu = None
         if action.kind in ("change_database", "database_page"):
-            await self._databases(state, catalog, send,
-                                  page=int(action.value) if action.kind == "database_page" else 0)
+            await self._databases(state, catalog, send, page=int(action.value) if action.kind == "database_page" else 0)
             return
         if action.kind == "database":
             database = catalog.get(str(action.value))
-            if database:
+            if database is None:
+                await self._databases(state, catalog, send, "You no longer have access to that database.\n\n")
+            else:
                 await self._connect(state, catalog, database, send)
             return
         selected = await self._selected(state, catalog, send)
@@ -269,8 +271,7 @@ class BotFlow:
             return
         database, target = selected
         if action.kind in ("questions", "question_page"):
-            await self._questions(state, catalog, database, send,
-                                  page=int(action.value) if action.kind == "question_page" else 0)
+            await self._questions(state, catalog, database, send, page=int(action.value) if action.kind == "question_page" else 0)
         elif action.kind == "custom_question":
             state.clear_pending()
             await send(f"Selected database: {database.name}\nType and send your question.", None)
@@ -279,16 +280,15 @@ class BotFlow:
         elif action.kind == "period_page" and state.pending_question is not None:
             await self._periods(state, catalog, database, state.pending_question, send, int(action.value))
         elif action.kind == "custom_period" and state.pending_question is not None:
-            await send("Type your date period, for example: 2026-01-01 to 2026-03-31.\n"
-                       "Use /cancel to choose a different question.", None)
+            await send("Type your date period, for example: 2026-01-01 to 2026-03-31.\nUse /cancel to choose another question.", None)
         elif action.kind == "period" and state.pending_question is not None:
             question = database.questions[state.pending_question]
             period = question.date_periods[int(action.value)]
-            prompt = combine_question(database, target, question.question, period.value)
+            prompt = compose_request(database, target, question.question, period.value)
             await self._ask(state, catalog, database, target, prompt, send)
 
-    async def reload_schema(self, state: Session, send: Send):
-        catalog = await self._catalog(state, send)
+    async def reload_schema(self, state: Session, send: Send, allowed_database_ids: frozenset[str]):
+        catalog = await self._catalog(state, send, allowed_database_ids)
         if catalog is None:
             return
         selected = await self._selected(state, catalog, send)
@@ -296,12 +296,11 @@ class BotFlow:
             return
         database, target = selected
         state.clear_pending()
-        await send(f"Refreshing {database.name}...", None)
+        await send(f"Refreshing metadata for {database.name}...", None)
         try:
-            await asyncio.to_thread(self.backend.connect, target)
-        except Exception:
-            logger.exception("Schema reload failed for database %s", database.id)
-            await self._databases(state, catalog, send,
-                                  "I could not refresh that database. Please reconnect or choose another database.\n\n")
+            await self.backend.refresh(target)
+        except Exception:  # noqa: BLE001
+            logger.exception("Metadata refresh failed for database %s", database.id)
+            await self._databases(state, catalog, send, "I could not refresh that database. Please reconnect or choose another.\n\n")
             return
-        await self._questions(state, catalog, database, send, "Database schema refreshed.\n\n")
+        await self._questions(state, catalog, database, send, "Database metadata refreshed.\n\n")

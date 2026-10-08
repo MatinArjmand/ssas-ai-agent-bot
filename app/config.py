@@ -1,4 +1,4 @@
-"""Editable menu configuration and immutable SSAS connection targets."""
+"""Editable database/question catalog and immutable SSAS connection targets."""
 
 from __future__ import annotations
 
@@ -9,14 +9,13 @@ import os
 from pathlib import Path
 import re
 
-from agent_knowledge import DaxExample
-
+from .knowledge import DaxExample
 
 MAX_DAX_LENGTH = 50_000
 
 
 class ConfigError(ValueError):
-    """An actionable configuration error for the administrator's console."""
+    pass
 
 
 def _text(value, location: str, limit: int = 2000) -> str:
@@ -32,13 +31,12 @@ def _object(value, location: str) -> dict:
 
 
 def _dax(value, location: str) -> str:
-    """Allow a JSON string or an editable list of lines; blank means no example."""
     if isinstance(value, list):
         if not all(isinstance(line, str) for line in value):
             raise ConfigError(f"{location} must contain only text lines.")
         value = "\n".join(value)
     if not isinstance(value, str):
-        raise ConfigError(f"{location} must be text or a list of text lines; use \"\" to leave it empty.")
+        raise ConfigError(f'{location} must be text or a list of text lines; use "" to leave it empty.')
     if len(value) > MAX_DAX_LENGTH:
         raise ConfigError(f"{location} must be at most {MAX_DAX_LENGTH} characters.")
     return value.strip()
@@ -51,19 +49,16 @@ def _list(value, location: str) -> list:
 
 
 def _expand(value: str, location: str) -> str:
-    """Support ${ENV_NAME} references without evaluating any code."""
     def substitute(match):
         name = match.group(1)
         resolved = os.environ.get(name, "").strip()
         if not resolved:
             raise ConfigError(f"Set {name} in .env for {location}, then restart the bot.")
         return resolved
-
     return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", substitute, value)
 
 
 def _connection_value(value: str) -> str:
-    # Quote values so a semicolon or quote in a catalog cannot change properties.
     return '"' + value.replace('"', '""') + '"'
 
 
@@ -74,10 +69,14 @@ class DatabaseTarget:
     server: str = field(repr=False)
     catalog: str
     connection_string: str = field(repr=False)
+    custom_connection: bool = False
 
     @property
     def identity(self) -> str:
-        content = json.dumps([self.database_id, self.server, self.catalog, self.connection_string])
+        content = json.dumps(
+            [self.database_id, self.server, self.catalog, self.connection_string, self.custom_connection],
+            separators=(",", ":"),
+        )
         return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
@@ -111,18 +110,18 @@ class Database:
     def target(self) -> DatabaseTarget:
         server = _expand(self.server, f"database {self.id}.server")
         catalog = _expand(self.database, f"database {self.id}.database")
+        custom = False
         if self.connection_string_env:
-            # An advanced connection string is authoritative; the administrator
-            # must keep its Data Source/Catalog consistent with this entry.
             connection = os.environ.get(self.connection_string_env, "").strip()
             if not connection:
                 raise ConfigError(f"Set {self.connection_string_env} in .env and restart the bot.")
+            custom = True
         else:
             connection = (
                 f"Provider=MSOLAP;Data Source={_connection_value(server)};"
                 f"Catalog={_connection_value(catalog)};"
             )
-        return DatabaseTarget(self.id, self.name, server, catalog, connection)
+        return DatabaseTarget(self.id, self.name, server, catalog, connection, custom)
 
 
 @dataclass(frozen=True)
@@ -133,9 +132,12 @@ class Catalog:
     def get(self, database_id: str | None) -> Database | None:
         return next((db for db in self.databases if db.id == database_id), None)
 
+    def permitted(self, database_ids: frozenset[str] | set[str] | tuple[str, ...]) -> "Catalog":
+        allowed = set(database_ids)
+        return Catalog(self.revision, tuple(db for db in self.databases if db.id in allowed))
+
 
 def load_catalog(path: Path) -> Catalog:
-    """Read on each interaction; invalid edits fail closed with a useful log."""
     try:
         raw = path.read_text(encoding="utf-8-sig")
         root = _object(json.loads(raw), "Root")
@@ -176,7 +178,9 @@ def load_catalog(path: Path) -> Catalog:
                         _text(period.get("label"), f"{ploc}.label", 100),
                         _text(period.get("value"), f"{ploc}.value", 1000),
                     ))
-            questions.append(Question(label, question, tuple(periods), _dax(item.get("dax", ""), f"{qloc}.dax")))
+            questions.append(Question(
+                label, question, tuple(periods), _dax(item.get("dax", ""), f"{qloc}.dax")
+            ))
         connection_env = entry.get("connection_string_env")
         if connection_env is not None:
             connection_env = _text(connection_env, f"{loc}.connection_string_env", 100)

@@ -1,4 +1,6 @@
 python-telegram-bot>=22.8,<23
 python-dotenv>=1.0
 openai>=1.54,<3
-pyadomd
+mcp>=2.0,<3
+pythonnet>=3.0.3
+pyadomd>=0.1.1

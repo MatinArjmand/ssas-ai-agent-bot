@@ -1,7 +1,0 @@
-# Add approved Technolife emails below, one per line.
-# Only exact @technolife.com addresses are accepted. Case is ignored.
-# Lines beginning with # are comments and do not grant access.
-
-# Removing an email revokes its linked Telegram account on its next request.
-
-

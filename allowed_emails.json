@@ -1,0 +1,9 @@
+{
+  "_instructions": "Assign only the database IDs each email is allowed to use. Empty databases means registered but no database access.",
+  "users": [
+    {
+      "email": "name@gmail.com",
+      "databases": ["main", "second_database"]
+    }
+  ]
+}

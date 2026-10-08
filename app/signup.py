@@ -1,4 +1,4 @@
-"""First-use email signup. No password or email verification step."""
+"""First-use email signup. No password or mailbox verification."""
 
 from __future__ import annotations
 
@@ -7,8 +7,7 @@ from dataclasses import dataclass
 import logging
 import time
 
-from email_auth import Access, AuthStore, RegistrationError
-
+from .auth import Access, AuthStore, RegistrationError
 
 logger = logging.getLogger(__name__)
 SIGNUP_TIMEOUT = 15 * 60
@@ -32,10 +31,8 @@ class SignupFlow:
     async def access(self, telegram_id: int, send) -> Access | None:
         try:
             return await asyncio.to_thread(self.store.access, telegram_id)
-        except Exception as error:
-            # Never log the Telegram update, message text, or credentials.
-            logger.error("Cannot check email authorization (%s). Check the account file and email allowlist.",
-                         type(error).__name__)
+        except Exception as error:  # noqa: BLE001
+            logger.error("Cannot check email authorization (%s).", type(error).__name__)
             await send("Account access is temporarily unavailable. Please contact the administrator.", None)
             return None
 
@@ -51,12 +48,14 @@ class SignupFlow:
             return False
         state.stage = "email"
         state.expires_at = self.clock() + SIGNUP_TIMEOUT
-        await send("Welcome. To register, send your Technolife work email (name@technolife.com).\n"
-                   "Use /cancel to stop signup.", None)
+        await send(
+            "Welcome. To register, send your approved Gmail address (name@gmail.com).\n"
+            "Use /cancel to stop signup.",
+            None,
+        )
         return False
 
     async def text(self, telegram_id: int, state: SignupSession, text: str, send) -> bool:
-        """Consume signup text. True means registration/access is now complete."""
         access = await self.access(telegram_id, send)
         if access is None:
             state.reset()
@@ -74,20 +73,21 @@ class SignupFlow:
             state.reset()
             await send("Signup expired. Use /start to begin again.", None)
             return False
-
         try:
             if state.stage == "email":
                 account = await asyncio.to_thread(self.store.register, telegram_id, text)
                 state.reset()
-                await send(f"Registration complete for {account.email}.\n"
-                           "This Telegram account is now linked. Next time, /start will recognize you automatically.", None)
+                await send(
+                    f"Registration complete for {account.email}.\n"
+                    "This Telegram account is now linked. Next time, /start will recognize you automatically.",
+                    None,
+                )
                 return True
         except RegistrationError as error:
-            # Only controlled, non-secret messages from our validation code.
             await send(str(error), None)
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001
             state.reset()
-            logger.error("Signup failed (%s). No signup message content was logged.", type(error).__name__)
+            logger.error("Signup failed (%s).", type(error).__name__)
             await send("Registration is temporarily unavailable. Please contact the administrator.", None)
         return False
 
