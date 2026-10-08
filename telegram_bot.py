@@ -1,357 +1,301 @@
-"""Telegram front-end for the existing SSAS/Qwen AI agent.
-
-The AI/database logic stays in new_qwen_agent.py. This file only:
-- receives Telegram messages via long polling,
-- checks an editable allowlist,
-- passes approved questions to ask(question, model_schema), and
-- sends the answer back to Telegram.
-"""
+"""Telegram front-end with first-use Technolife email/password registration."""
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING
 
-from dotenv import load_dotenv
+from agent_service import AgentService
+from bot_config import load_catalog
+from bot_flow import BotFlow, Session
+from email_auth import AuthStore, load_allowed_emails
+from signup_flow import SignupFlow, SignupSession
 
-# Load the .env next to this script even if the bot is started from another folder.
+if TYPE_CHECKING:
+    from telegram import Update
+    from telegram.ext import ContextTypes
+
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
-
-# Import after loading .env because new_qwen_agent validates its settings at import time.
-from new_qwen_agent import ask, load_schema  # noqa: E402
-
-from telegram import Chat, Update  # noqa: E402
-from telegram.constants import ChatAction  # noqa: E402
-from telegram.ext import (  # noqa: E402
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
-
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ALLOWLIST_FILE = Path(
-    os.getenv(
-        "TELEGRAM_ALLOWED_USERS_FILE",
-        str(BASE_DIR / "allowed_users.txt"),
-    )
-)
-
-# Telegram text messages are limited to 4096 characters. Leave some margin.
 TELEGRAM_MESSAGE_CHUNK = 3900
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
 logger = logging.getLogger("ssas_telegram_bot")
 
-# The schema is loaded once at startup and can be refreshed with /reloadschema.
-model_schema: str | None = None
 
-# The existing agent does blocking network/database work. Serializing calls is a
-# conservative first setup for PyADOMD/SSAS and prevents several users from
-# hammering the laptop at the same time.
-query_lock = asyncio.Lock()
-schema_lock = asyncio.Lock()
+def config_path(env_name: str, default_name: str) -> Path:
+    path = Path(os.getenv(env_name, default_name))
+    return path if path.is_absolute() else BASE_DIR / path
 
 
-def _normalize_allowlist_entry(value: str) -> str:
-    """Normalize an allowlist line for comparison."""
-    value = value.strip()
-    if not value:
-        return ""
-
-    if value.startswith("@"):
-        return "@" + value[1:].strip().lower()
-
-    # Numeric Telegram IDs are kept as strings.
-    return value
-
-
-def load_allowed_users() -> set[str]:
-    """Read the allowlist from disk.
-
-    This is intentionally called for every request so adding/removing a line in
-    allowed_users.txt takes effect without restarting the bot.
-    """
-    try:
-        lines: Iterable[str] = ALLOWLIST_FILE.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        logger.error("Allowlist file does not exist: %s", ALLOWLIST_FILE)
-        return set()
-    except OSError:
-        logger.exception("Could not read allowlist file: %s", ALLOWLIST_FILE)
-        return set()
-
-    allowed: set[str] = set()
-
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-
-        # Permit comments after an entry: @someone  # note
-        entry = line.split("#", 1)[0].strip()
-        normalized = _normalize_allowlist_entry(entry)
-        if normalized:
-            allowed.add(normalized)
-
-    return allowed
-
-
-def user_is_allowed(update: Update) -> bool:
-    """Return True when the Telegram sender is in allowed_users.txt."""
-    user = update.effective_user
-    if user is None:
-        return False
-
-    allowed = load_allowed_users()
-
-    # Numeric Telegram user ID is the preferred stable identifier.
-    if str(user.id) in allowed:
-        return True
-
-    # Username support is convenient for initial setup.
-    if user.username:
-        username = "@" + user.username.lower()
-        if username in allowed:
-            return True
-
-    return False
-
-
-async def authorize(update: Update) -> bool:
-    """Apply private-chat and allowlist checks."""
-    message = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
-
-    if message is None or chat is None or user is None:
-        return False
-
-    # Keep database answers out of group chats by default.
-    if chat.type != Chat.PRIVATE:
-        await message.reply_text(
-            "For security, please talk to this bot in a private Telegram chat."
-        )
-        return False
-
-    if user_is_allowed(update):
-        return True
-
-    username = f"@{user.username}" if user.username else "(no username)"
-    await message.reply_text(
-        "Access denied. You are not in allowed_users.txt.\n\n"
-        f"Your username: {username}\n"
-        f"Your Telegram user ID: {user.id}\n\n"
-        "Ask the bot administrator to add either your @username or numeric user ID."
-    )
-    logger.warning(
-        "Denied Telegram user id=%s username=%s",
-        user.id,
-        user.username,
-    )
-    return False
-
-
-async def send_long_text(update: Update, text: str) -> None:
-    """Send an answer safely even if it exceeds one Telegram message."""
-    message = update.effective_message
-    if message is None:
-        return
-
+def text_chunks(text: str):
+    """Leave room below Telegram's limit, including text containing emoji."""
     text = str(text).strip() or "The agent returned an empty answer."
+    chunk = []
+    units = 0
+    for char in text:
+        size = 2 if ord(char) > 0xFFFF else 1
+        if units + size > TELEGRAM_MESSAGE_CHUNK:
+            yield "".join(chunk)
+            chunk, units = [], 0
+        chunk.append(char)
+        units += size
+    if chunk:
+        yield "".join(chunk)
 
-    for start in range(0, len(text), TELEGRAM_MESSAGE_CHUNK):
-        await message.reply_text(text[start : start + TELEGRAM_MESSAGE_CHUNK])
+
+def make_sender(update):
+    async def send(text, choices=None):
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+        keyboard = None
+        if choices:
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(label, callback_data=data)]
+                for label, data in choices
+            ])
+        chunks = list(text_chunks(text))
+        for i, chunk in enumerate(chunks):
+            await update.effective_message.reply_text(
+                chunk,
+                parse_mode=None,
+                reply_markup=keyboard if i == len(chunks) - 1 else None,
+            )
+    return send
+
+
+def session(context) -> Session:
+    return context.user_data.setdefault("session", Session())
+
+
+def signup_session(context) -> SignupSession:
+    return context.user_data.setdefault("signup", SignupSession())
+
+
+def flow(context) -> BotFlow:
+    return context.application.bot_data["flow"]
+
+
+def signup(context) -> SignupFlow:
+    return context.application.bot_data["signup"]
+
+
+async def private_chat(update) -> bool:
+    if update.effective_message is None or update.effective_chat is None or update.effective_user is None:
+        return False
+    if update.effective_chat.type != "private":
+        await update.effective_message.reply_text("Please use this bot in a private Telegram chat.")
+        return False
+    return True
+
+
+async def authorize(update, context) -> bool:
+    """Recheck the mapped email against the editable allowlist on every request."""
+    if not await private_chat(update):
+        return False
+    send = make_sender(update)
+    access = await signup(context).access(update.effective_user.id, send)
+    if access and access.allowed:
+        return True
+    session(context).reset()
+    if access is None:
+        signup_session(context).reset()
+        return False
+    if access.account:
+        signup_session(context).reset()
+        await send("Your email is no longer approved to use the bot. Please contact the administrator.", None)
+    elif signup_session(context).stage != "idle":
+        await send("Finish your signup first, or use /start to begin again and /cancel to stop.", None)
+    else:
+        await signup(context).start(update.effective_user.id, signup_session(context), send)
+    return False
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await authorize(update):
+    if not await private_chat(update):
         return
+    session(context).reset()
+    send = make_sender(update)
+    if await signup(context).start(update.effective_user.id, signup_session(context), send):
+        await flow(context).start(session(context), send)
 
-    await update.effective_message.reply_text(
-        "Connected to the SSAS AI agent.\n\n"
-        "Send me a business/data question as a normal message and I will pass it "
-        "to the agent.\n\n"
-        "Commands:\n"
-        "/help - show instructions\n"
-        "/whoami - show your Telegram identity\n"
-        "/reloadschema - re-read the live SSAS model schema"
-    )
+
+async def select_database_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await authorize(update, context):
+        await flow(context).start(session(context), make_sender(update))
+
+
+async def questions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await authorize(update, context):
+        await flow(context).questions(session(context), make_sender(update))
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await private_chat(update):
+        return
+    if signup_session(context).stage != "idle":
+        session(context).reset()
+        await signup(context).cancel(signup_session(context), make_sender(update))
+    elif await authorize(update, context):
+        await flow(context).questions(session(context), make_sender(update))
+
+
+async def reload_schema_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await authorize(update, context):
+        await flow(context).reload_schema(session(context), make_sender(update))
+
+
+async def delete_password_message(update) -> None:
+    from telegram.error import TelegramError
+
+    try:
+        await update.effective_message.delete()
+    except TelegramError:
+        logger.warning("Could not delete a password message. No message content was logged.")
+        await update.effective_message.reply_text(
+            "I could not remove that password message. Please delete it from this chat."
+        )
+
+
+async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await private_chat(update) or not update.effective_message.text:
+        return
+    registration = signup_session(context)
+    # Inspect registration state before access: even an account registered by
+    # another process must never forward a pending password message to the AI.
+    sensitive = registration.stage in ("password", "confirm")
+    if sensitive:
+        await delete_password_message(update)
+    send = make_sender(update)
+    access = await signup(context).access(update.effective_user.id, send)
+    if access is None:
+        registration.reset()
+        session(context).reset()
+        return
+    if registration.stage != "idle" or not access.allowed:
+        session(context).reset()
+        complete = await signup(context).text(
+            update.effective_user.id, registration, update.effective_message.text, send,
+        )
+        if complete:
+            await flow(context).start(session(context), send)
+        return
+    await flow(context).text(session(context), update.effective_message.text, send)
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from telegram.error import TelegramError
+
+    query = update.callback_query
+    if query is None:
+        return
+    try:
+        await query.answer()
+    except TelegramError:
+        logger.warning("Could not acknowledge callback query; it may have expired.")
+    if await authorize(update, context):
+        await flow(context).callback(session(context), query.data or "", make_sender(update))
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await authorize(update):
+    if not await private_chat(update):
         return
-
     await update.effective_message.reply_text(
-        "Just send a question, for example:\n\n"
-        '"Which customers had the highest delivery volume last month?"\n\n'
-        "The bot uses the same SSAS/Qwen agent as new_qwen_agent.py. "
-        "The allowlist is read from allowed_users.txt on every request, so you "
-        "can edit that file without restarting the bot."
+        "First use: send /start, enter your approved @technolife.com email, "
+        "then set and confirm a separate bot password. No email verification is required.\n"
+        "Your Telegram account is remembered after registration.\n\n"
+        "After registration:\n"
+        "1. Choose a database using /start or /selectdatabase.\n"
+        "2. Choose a recommended question, then select or type its date period.\n"
+        "3. Or type your own question to send it directly to the agent.\n\n"
+        "/selectdatabase - change database\n"
+        "/questions - show recommended questions\n"
+        "/cancel - cancel signup or the current question/date selection\n"
+        "/reloadschema - refresh the selected database schema\n"
+        "/whoami - show your linked email and Telegram identity\n"
+        "/help - show these instructions"
     )
 
 
 async def whoami_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # /whoami is intentionally available even to a denied user so the admin can
-    # obtain the person's stable Telegram numeric ID and add it to the allowlist.
-    message = update.effective_message
+    if not await private_chat(update):
+        return
+    send = make_sender(update)
+    access = await signup(context).access(update.effective_user.id, send)
+    if access is None:
+        return
     user = update.effective_user
-    chat = update.effective_chat
-
-    if message is None or user is None or chat is None:
-        return
-
-    if chat.type != Chat.PRIVATE:
-        await message.reply_text("Please use /whoami in a private chat with this bot.")
-        return
-
     username = f"@{user.username}" if user.username else "(no username)"
-    await message.reply_text(
-        f"Username: {username}\n"
-        f"Telegram user ID: {user.id}\n\n"
-        "For a long-term allowlist, the numeric user ID is recommended."
-    )
-
-
-async def reload_schema_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    global model_schema
-
-    if not await authorize(update):
-        return
-
-    message = update.effective_messsage
-    await message.reply_text("Reloading the SSAS schema...")
-
-    try:
-        async with schema_lock:
-            # Do not block Telegram's asyncio event loop while querying SSAS.
-            new_schema = await asyncio.to_thread(load_schema)
-            model_schema = new_schema
-    except Exception:
-        logger.exception("Schema reload failed")
-        await message.reply_text(
-            "I could not reload the SSAS schema. Check the bot console/log for the "
-            "full error."
-        )
-        return
-
-    await message.reply_text("SSAS schema reloaded successfully.")
-
-
-async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await authorize(update):
-        return
-
-    message = update.effective_message
-    if message is None or not message.text:
-        return
-
-    question = message.text.strip()
-    if not question:
-        return
-
-    if model_schema is None:
-        await message.reply_text(
-            "The SSAS schema is not loaded. Restart the bot or use /reloadschema."
-        )
-        return
-
-    user = update.effective_user
-    logger.info(
-        "Question from id=%s username=%s: %s",
-        user.id if user else None,
-        user.username if user else None,
-        question,
-    )
-
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action=ChatAction.TYPING,
-    )
-
-    try:
-        # ask() calls Qwen and SSAS synchronously, so run it in a worker thread.
-        # Serialize initial usage for predictable SSAS behavior on the laptop.
-        async with query_lock:
-            schema_snapshot = model_schema
-            answer = await asyncio.to_thread(
-                ask,
-                question,
-                schema_snapshot,
-            )
-    except Exception:
-        logger.exception("Agent failed while answering a Telegram question")
-        await message.reply_text(
-            "I could not answer that question because the AI/SSAS agent returned "
-            "an error. Check the bot console/log for details."
-        )
-        return
-
-    await send_long_text(update, answer)
+    email = access.account.email if access.account else "Not registered"
+    status = "Authorized" if access.allowed else "Not authorized"
+    await send(f"Username: {username}\nTelegram user ID: {user.id}\n"
+               f"Linked email: {email}\nStatus: {status}", None)
 
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await authorize(update):
-        return
-    await update.effective_message.reply_text(
-        "Unknown command. Use /help, or send your question as normal text."
-    )
+    # Allow passwords that start with / unless they are one of the known bot
+    # commands above. They remain registration input and never become AI input.
+    if signup_session(context).stage in ("password", "confirm"):
+        await handle_question(update, context)
+    elif await authorize(update, context):
+        await update.effective_message.reply_text("Unknown command. Use /help for available commands.")
+
+
+async def post_init(application):
+    from telegram import BotCommand
+
+    await application.bot.set_my_commands([
+        BotCommand("start", "Register or choose a database"),
+        BotCommand("selectdatabase", "Choose or change database"),
+        BotCommand("questions", "Show recommended questions"),
+        BotCommand("cancel", "Cancel signup or the current selection"),
+        BotCommand("reloadschema", "Refresh selected database schema"),
+        BotCommand("whoami", "Show linked email and Telegram identity"),
+        BotCommand("help", "Show instructions"),
+    ])
+
+
+async def on_error(update, context):
+    # Exception strings from third-party clients can contain request data. Log
+    # the type, never the Telegram update or credential-bearing message.
+    logger.error("Unhandled Telegram error (%s).", type(context.error).__name__)
 
 
 def main() -> None:
-    global model_schema
+    from dotenv import load_dotenv
+    from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError(
-            "Missing TELEGRAM_BOT_TOKEN. Add it to the .env file next to "
-            "telegram_bot.py."
-        )
-
-    if not ALLOWLIST_FILE.exists():
-        raise RuntimeError(
-            f"Allowlist file not found: {ALLOWLIST_FILE}. "
-            "Create allowed_users.txt before starting the bot."
-        )
-
-    logger.info("Loading SSAS schema before starting Telegram polling...")
-    model_schema = load_schema()
-    logger.info("SSAS schema loaded. Starting Telegram bot.")
-
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
+    load_dotenv(BASE_DIR / ".env")
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("Add TELEGRAM_BOT_TOKEN to the .env file next to telegram_bot.py.")
+    email_file = config_path("TELEGRAM_ALLOWED_EMAILS_FILE", "allowed_emails.txt")
+    account_file = config_path("TELEGRAM_AUTH_DB_FILE", "data/bot_auth.sqlite3")
+    auth_store = AuthStore(account_file, email_file)
+    database_file = config_path("TELEGRAM_DATABASES_FILE", "databases.json")
+    load_catalog(database_file)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    if not load_allowed_emails(email_file):
+        logger.warning("The email allowlist is empty. Add approved addresses to %s before signup.", email_file)
+    application = Application.builder().token(token).concurrent_updates(False).post_init(post_init).build()
+    application.bot_data["flow"] = BotFlow(database_file, AgentService())
+    application.bot_data["signup"] = SignupFlow(auth_store)
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("selectdatabase", select_database_command))
+    application.add_handler(CommandHandler("questions", questions_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("whoami", whoami_command))
     application.add_handler(CommandHandler("reloadschema", reload_schema_command))
-
-    # Normal questions. Exclude commands and keep this bot private-chat only.
-    application.add_handler(
-        MessageHandler(
-            filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
-            handle_question,
-        )
-    )
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_question,
+    ))
     application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
-
-    # Long polling means no public web server, FastAPI endpoint, domain, or TLS
-    # certificate is needed for this local-laptop setup.
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
+    application.add_error_handler(on_error)
+    logger.info("Starting Telegram bot with Technolife email registration.")
+    application.run_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=True)
 
 
 if __name__ == "__main__":

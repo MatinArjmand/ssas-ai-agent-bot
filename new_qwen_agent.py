@@ -30,8 +30,6 @@ ADOMD_PATH = os.getenv("ADOMD_PATH")
 required_settings = {
     "QWEN_API_KEY": QWEN_API_KEY,
     "QWEN_BASE_URL": QWEN_BASE_URL,
-    "SSAS_SERVER": SSAS_SERVER,
-    "SSAS_DATABASE": SSAS_DATABASE,
     "ADOMD_PATH": ADOMD_PATH,
 }
 
@@ -81,7 +79,17 @@ CONNECTION_STRING = (
     "Provider=MSOLAP;"
     f"Data Source={SSAS_SERVER};"
     f"Catalog={SSAS_DATABASE};"
-)
+) if SSAS_SERVER and SSAS_DATABASE else None
+
+
+def resolve_connection_string(connection_string=None):
+    """Explicit per-request targets take precedence; CLI keeps its .env default."""
+    resolved = connection_string if connection_string is not None else CONNECTION_STRING
+    if not resolved:
+        raise RuntimeError(
+            "Supply a database connection or set SSAS_SERVER and SSAS_DATABASE in .env."
+        )
+    return resolved
 
 
 # =========================================================
@@ -217,14 +225,14 @@ def fetch_rowset(connection, query):
 # No model schema is hard-coded.
 # =========================================================
 
-def discover_model():
+def discover_model(connection_string=None, database_name=None):
 
     print(
         f"Reading metadata from "
-        f"{SSAS_SERVER} / {SSAS_DATABASE} ..."
+        f"{database_name or SSAS_DATABASE or 'selected database'} ..."
     )
 
-    with Pyadomd(CONNECTION_STRING) as connection:
+    with Pyadomd(resolve_connection_string(connection_string)) as connection:
 
         tables = fetch_rowset(
             connection,
@@ -352,7 +360,7 @@ def get_user_tables(metadata):
 # This is the schema sent to Qwen.
 # =========================================================
 
-def build_schema(metadata):
+def build_schema(metadata, database_name=None):
 
     tables = metadata["tables"]
     columns = metadata["columns"]
@@ -376,7 +384,7 @@ def build_schema(metadata):
     lines = []
 
     lines.append(
-        f"DATABASE: {SSAS_DATABASE}"
+        f"DATABASE: {database_name or SSAS_DATABASE or 'selected database'}"
     )
 
     lines.append("")
@@ -1091,12 +1099,12 @@ def validate_dax(dax):
 # EXECUTE DAX AGAINST SSAS
 # =========================================================
 
-def execute_dax(dax):
+def execute_dax(dax, connection_string=None):
 
     validate_dax(dax)
 
     with Pyadomd(
-        CONNECTION_STRING
+        resolve_connection_string(connection_string)
     ) as connection:
 
         with connection.cursor().execute(
@@ -1188,6 +1196,7 @@ RULES:
 def ask(
     question,
     model_schema,
+    connection_string=None,
 ):
 
     print(
@@ -1199,6 +1208,7 @@ def ask(
             question=question,
             model_schema=model_schema,
             max_repairs=2,
+            connection_string=connection_string,
         )
     )
 
@@ -1229,12 +1239,13 @@ def ask(
 # LOAD / RELOAD LIVE SSAS SCHEMA
 # =========================================================
 
-def load_schema():
+def load_schema(connection_string=None, database_name=None):
 
-    metadata = discover_model()
+    metadata = discover_model(connection_string, database_name)
 
     schema = build_schema(
-        metadata
+        metadata,
+        database_name=database_name,
     )
 
     (
@@ -1412,6 +1423,7 @@ def generate_and_execute_dax(
     question,
     model_schema,
     max_repairs=2,
+    connection_string=None,
 ):
 
     dax = generate_dax(
@@ -1436,7 +1448,8 @@ def generate_and_execute_dax(
         try:
 
             results = execute_dax(
-                dax
+                dax,
+                connection_string=connection_string,
             )
 
             return dax, results
