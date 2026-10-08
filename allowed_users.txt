@@ -1,5 +1,0 @@
-# One entry per line.
-# Supported formats:
-#   @username
-#   123456789        (recommended: stable Telegram numeric user ID)
-

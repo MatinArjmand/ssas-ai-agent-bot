@@ -10,7 +10,7 @@ from telegram_bot import config_path
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("list", help="Show registered email/Telegram pairs; never prints password hashes.")
+    commands.add_parser("list", help="Show registered emails, Telegram IDs and registration dates.")
     reset = commands.add_parser("reset", help="Remove one registration so its email can register again.")
     reset.add_argument("email", help="Exact @technolife.com email to reset.")
     args = parser.parse_args()

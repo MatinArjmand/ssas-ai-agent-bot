@@ -4,6 +4,7 @@ import json
 import time
 
 from dotenv import load_dotenv
+from agent_knowledge import format_knowledge_base
 
 
 # =========================================================
@@ -919,6 +920,7 @@ def call_qwen(
 def generate_dax(
     question,
     model_schema,
+    knowledge_base=(),
 ):
 
     prompt = f"""
@@ -940,6 +942,8 @@ or value that does not appear in this schema.
 ==============================================
 
 Convert the user's question into a READ-ONLY DAX QUERY.
+
+{format_knowledge_base(knowledge_base)}
 
 RULES:
 
@@ -1197,6 +1201,7 @@ def ask(
     question,
     model_schema,
     connection_string=None,
+    knowledge_base=(),
 ):
 
     print(
@@ -1209,6 +1214,7 @@ def ask(
             model_schema=model_schema,
             max_repairs=2,
             connection_string=connection_string,
+            knowledge_base=knowledge_base,
         )
     )
 
@@ -1289,6 +1295,7 @@ def repair_dax(
     model_schema,
     bad_dax,
     ssas_error,
+    knowledge_base=(),
 ):
 
     prompt = f"""
@@ -1298,6 +1305,8 @@ A previous DAX query was generated for a user's question,
 but SSAS rejected it.
 
 Your task is to FIX the query.
+
+{format_knowledge_base(knowledge_base)}
 
 ================ MODEL SCHEMA ================
 
@@ -1424,11 +1433,13 @@ def generate_and_execute_dax(
     model_schema,
     max_repairs=2,
     connection_string=None,
+    knowledge_base=(),
 ):
 
     dax = generate_dax(
         question,
         model_schema,
+        knowledge_base=knowledge_base,
     )
 
     for attempt in range(
@@ -1476,6 +1487,7 @@ def generate_and_execute_dax(
                 model_schema=model_schema,
                 bad_dax=dax,
                 ssas_error=ssas_error,
+                knowledge_base=knowledge_base,
             )
 
             print(

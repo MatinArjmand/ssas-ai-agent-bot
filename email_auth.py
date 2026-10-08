@@ -1,4 +1,4 @@
-"""Email allowlist, password hashing and persistent Telegram account bindings.
+"""Email allowlist and persistent Telegram account bindings.
 
 Registration intentionally does not verify mailbox ownership. The administrator
 controls which exact @technolife.com addresses may register.
@@ -9,12 +9,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import base64
-import hashlib
-import hmac
 from pathlib import Path
 import re
-import secrets
 import sqlite3
 
 
@@ -53,47 +49,6 @@ def load_allowed_emails(path: Path) -> set[str]:
     return emails
 
 
-SCRYPT_N = 2 ** 17
-SCRYPT_R = 8
-SCRYPT_P = 1
-SCRYPT_MAXMEM = 256 * 1024 * 1024
-
-
-def _derive(password: str, salt: bytes) -> bytes:
-    return hashlib.scrypt(password.encode("utf-8"), salt=salt, n=SCRYPT_N,
-                          r=SCRYPT_R, p=SCRYPT_P, dklen=32, maxmem=SCRYPT_MAXMEM)
-
-
-def _decode_hash(encoded: str) -> tuple[bytes, bytes]:
-    algorithm, n, r, p, salt_text, digest_text = encoded.split("$")
-    if (algorithm, n, r, p) != ("scrypt", str(SCRYPT_N), str(SCRYPT_R), str(SCRYPT_P)):
-        raise ValueError("Unsupported password hash")
-    salt = base64.b64decode(salt_text, validate=True)
-    digest = base64.b64decode(digest_text, validate=True)
-    if len(salt) != 16 or len(digest) != 32:
-        raise ValueError("Invalid password hash")
-    return salt, digest
-
-
-def hash_password(password: str) -> str:
-    if not 12 <= len(password) <= 128 or not password.strip():
-        raise RegistrationError("Choose a bot password between 12 and 128 characters.")
-    salt = secrets.token_bytes(16)
-    digest = _derive(password, salt)
-    return "$".join(("scrypt", str(SCRYPT_N), str(SCRYPT_R), str(SCRYPT_P),
-                     base64.b64encode(salt).decode("ascii"), base64.b64encode(digest).decode("ascii")))
-
-
-def password_matches(password: str, encoded: str) -> bool:
-    if not 12 <= len(password) <= 128:
-        return False
-    try:
-        salt, digest = _decode_hash(encoded)
-    except (ValueError, TypeError):
-        return False
-    return hmac.compare_digest(_derive(password, salt), digest)
-
-
 @dataclass(frozen=True)
 class Account:
     email: str
@@ -115,14 +70,34 @@ class AuthStore:
         database_path.parent.mkdir(parents=True, exist_ok=True)
         database_path.touch(mode=0o600, exist_ok=True)
         with self._connection() as connection:
+            # Serialize startup/migration with other writers. DDL and row copies
+            # commit together, so a failed migration preserves the old table.
+            connection.execute("PRAGMA secure_delete = ON")
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS accounts (
                     email TEXT PRIMARY KEY COLLATE NOCASE,
                     telegram_id INTEGER NOT NULL UNIQUE,
-                    password_hash TEXT NOT NULL,
                     registered_at TEXT NOT NULL
                 )
             """)
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(accounts)")}
+            if "password_hash" in columns:
+                # Upgrade the previous release while retaining every email/ID
+                # binding and registration date. No password data is copied.
+                connection.execute("""
+                    CREATE TABLE accounts_without_password (
+                        email TEXT PRIMARY KEY COLLATE NOCASE,
+                        telegram_id INTEGER NOT NULL UNIQUE,
+                        registered_at TEXT NOT NULL
+                    )
+                """)
+                connection.execute("""
+                    INSERT INTO accounts_without_password (email, telegram_id, registered_at)
+                    SELECT email, telegram_id, registered_at FROM accounts
+                """)
+                connection.execute("DROP TABLE accounts")
+                connection.execute("ALTER TABLE accounts_without_password RENAME TO accounts")
 
     @contextmanager
     def _connection(self):
@@ -157,25 +132,20 @@ class AuthStore:
             )
         return email
 
-    def register(self, telegram_id: int, email: str, password_hash: str) -> Account:
+    def register(self, telegram_id: int, email: str) -> Account:
         if not isinstance(telegram_id, int) or isinstance(telegram_id, bool) or telegram_id <= 0:
             raise RegistrationError("A valid private Telegram account is required.")
         email = normalize_email(email)
-        # Reject accidental plaintext writes even if this API is called directly.
-        try:
-            _decode_hash(password_hash)
-        except (ValueError, TypeError) as error:
-            raise RegistrationError("The password could not be saved. Please restart signup.") from error
         registered_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         try:
             with self._connection() as connection:
                 # A competing signup cannot overwrite an existing email or ID.
                 connection.execute("BEGIN IMMEDIATE")
                 if email not in load_allowed_emails(self.allowlist_path):
-                    raise RegistrationError("This email is no longer approved. Contact the administrator.")
+                    raise RegistrationError("This email is not approved to use the bot. Ask the administrator to add it.")
                 connection.execute(
-                    "INSERT INTO accounts (email, telegram_id, password_hash, registered_at) VALUES (?, ?, ?, ?)",
-                    (email, telegram_id, password_hash, registered_at),
+                    "INSERT INTO accounts (email, telegram_id, registered_at) VALUES (?, ?, ?)",
+                    (email, telegram_id, registered_at),
                 )
         except sqlite3.IntegrityError as error:
             raise RegistrationError(

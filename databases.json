@@ -9,6 +9,7 @@
         {
           "label": "most sold products",
           "question": "What are the most sold products?",
+          "dax": "",
           "date_periods": [
             "This month",
             "Last month",
@@ -22,6 +23,7 @@
         {
           "label": "Customers with the highest delivery volume",
           "question": "Which customers had the highest delivery volume?",
+          "dax": "",
           "date_periods": [
             "This month",
             "Last month",
@@ -35,12 +37,8 @@
         {
           "label": "Total delivery volume",
           "question": "What was the total delivery volume?",
+          "dax": "",
           "date_periods": ["Today", "Yesterday", "Last 7 days", "Last month"]
-        },
-        {
-          "label": "Monthly delivery trend",
-          "question": "Show the delivery volume by month.",
-          "date_periods": ["This year", "Last year", "Last 12 months"]
         }
       ]
     },
@@ -54,6 +52,7 @@
         {
           "label": "Total sales",
           "question": "What were the total sales?",
+          "dax": "",
           "date_periods": [
             "Last month",
             "This year",

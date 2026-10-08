@@ -1,4 +1,4 @@
-"""Telegram front-end with first-use Technolife email/password registration."""
+"""Telegram front-end with first-use Technolife email registration."""
 
 from __future__ import annotations
 
@@ -144,27 +144,10 @@ async def reload_schema_command(update: Update, context: ContextTypes.DEFAULT_TY
         await flow(context).reload_schema(session(context), make_sender(update))
 
 
-async def delete_password_message(update) -> None:
-    from telegram.error import TelegramError
-
-    try:
-        await update.effective_message.delete()
-    except TelegramError:
-        logger.warning("Could not delete a password message. No message content was logged.")
-        await update.effective_message.reply_text(
-            "I could not remove that password message. Please delete it from this chat."
-        )
-
-
 async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await private_chat(update) or not update.effective_message.text:
         return
     registration = signup_session(context)
-    # Inspect registration state before access: even an account registered by
-    # another process must never forward a pending password message to the AI.
-    sensitive = registration.stage in ("password", "confirm")
-    if sensitive:
-        await delete_password_message(update)
     send = make_sender(update)
     access = await signup(context).access(update.effective_user.id, send)
     if access is None:
@@ -200,8 +183,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not await private_chat(update):
         return
     await update.effective_message.reply_text(
-        "First use: send /start, enter your approved @technolife.com email, "
-        "then set and confirm a separate bot password. No email verification is required.\n"
+        "First use: send /start and enter your approved @technolife.com email.\n"
         "Your Telegram account is remembered after registration.\n\n"
         "After registration:\n"
         "1. Choose a database using /start or /selectdatabase.\n"
@@ -232,11 +214,7 @@ async def whoami_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Allow passwords that start with / unless they are one of the known bot
-    # commands above. They remain registration input and never become AI input.
-    if signup_session(context).stage in ("password", "confirm"):
-        await handle_question(update, context)
-    elif await authorize(update, context):
+    if await authorize(update, context):
         await update.effective_message.reply_text("Unknown command. Use /help for available commands.")
 
 
@@ -247,7 +225,7 @@ async def post_init(application):
         BotCommand("start", "Register or choose a database"),
         BotCommand("selectdatabase", "Choose or change database"),
         BotCommand("questions", "Show recommended questions"),
-        BotCommand("cancel", "Cancel signup or the current selection"),
+        BotCommand("cancel", "Cancel signup or the current selections"),
         BotCommand("reloadschema", "Refresh selected database schema"),
         BotCommand("whoami", "Show linked email and Telegram identity"),
         BotCommand("help", "Show instructions"),

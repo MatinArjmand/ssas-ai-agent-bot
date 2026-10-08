@@ -196,7 +196,11 @@ class BotFlow:
         state.clear_pending()
         await send(f"Checking {database.name}. Please wait...", None)
         try:
-            answer = await asyncio.to_thread(self.backend.ask, target, question)
+            # Read examples from this interaction's catalog, independently of
+            # the cached schema, so saved DAX edits take effect on the next ask.
+            answer = await asyncio.to_thread(
+                self.backend.ask, target, question, knowledge_base=database.knowledge_base,
+            )
         except Exception:
             logger.exception("Agent failed for database %s", database.id)
             await send("I could not answer that question. Please try again or contact the bot administrator.", None)

@@ -1,13 +1,13 @@
-"""First-use email/password signup. No email delivery or verification step."""
+"""First-use email signup. No password or email verification step."""
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import logging
 import time
 
-from email_auth import Access, AuthStore, RegistrationError, hash_password, password_matches
+from email_auth import Access, AuthStore, RegistrationError
 
 
 logger = logging.getLogger(__name__)
@@ -17,14 +17,10 @@ SIGNUP_TIMEOUT = 15 * 60
 @dataclass
 class SignupSession:
     stage: str = "idle"
-    email: str | None = None
-    password_hash: str | None = field(default=None, repr=False)
     expires_at: float = 0
 
     def reset(self):
         self.stage = "idle"
-        self.email = None
-        self.password_hash = None
         self.expires_at = 0
 
 
@@ -81,23 +77,7 @@ class SignupFlow:
 
         try:
             if state.stage == "email":
-                state.email = await asyncio.to_thread(self.store.available_email, text)
-                state.stage = "password"
-                await send("Email approved. Set a new password for this bot (12–128 characters).\n"
-                           "Choose a separate password; do not send your work email password.\n"
-                           "I will try to delete your password messages after receiving them.", None)
-            elif state.stage == "password":
-                # Recheck approval immediately before requesting/saving a hash.
-                await asyncio.to_thread(self.store.available_email, state.email)
-                state.password_hash = await asyncio.to_thread(hash_password, text)
-                state.stage = "confirm"
-                await send("Send the same bot password again to confirm it.", None)
-            elif state.stage == "confirm":
-                matches = await asyncio.to_thread(password_matches, text, state.password_hash)
-                if not matches:
-                    await send("The passwords do not match. Try the confirmation again, or use /start to restart signup.", None)
-                    return False
-                account = await asyncio.to_thread(self.store.register, telegram_id, state.email, state.password_hash)
+                account = await asyncio.to_thread(self.store.register, telegram_id, text)
                 state.reset()
                 await send(f"Registration complete for {account.email}.\n"
                            "This Telegram account is now linked. Next time, /start will recognize you automatically.", None)

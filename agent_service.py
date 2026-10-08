@@ -6,6 +6,7 @@ import importlib
 import threading
 
 from bot_config import DatabaseTarget
+from agent_knowledge import DaxExample
 
 
 class AgentService:
@@ -31,7 +32,8 @@ class AgentService:
             self._schemas[target.database_id] = (target.identity, schema)
             return schema
 
-    def ask(self, target: DatabaseTarget, question: str) -> str:
+    def ask(self, target: DatabaseTarget, question: str,
+            knowledge_base: tuple[DaxExample, ...] = ()) -> str:
         with self._lock:
             cached = self._schemas.get(target.database_id)
             if cached is None or cached[0] != target.identity:
@@ -42,4 +44,5 @@ class AgentService:
                 question,
                 schema,
                 connection_string=target.connection_string,
+                knowledge_base=knowledge_base,
             )

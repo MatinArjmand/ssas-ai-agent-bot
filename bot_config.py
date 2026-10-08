@@ -9,6 +9,11 @@ import os
 from pathlib import Path
 import re
 
+from agent_knowledge import DaxExample
+
+
+MAX_DAX_LENGTH = 50_000
+
 
 class ConfigError(ValueError):
     """An actionable configuration error for the administrator's console."""
@@ -24,6 +29,19 @@ def _object(value, location: str) -> dict:
     if not isinstance(value, dict):
         raise ConfigError(f"{location} must be a JSON object.")
     return value
+
+
+def _dax(value, location: str) -> str:
+    """Allow a JSON string or an editable list of lines; blank means no example."""
+    if isinstance(value, list):
+        if not all(isinstance(line, str) for line in value):
+            raise ConfigError(f"{location} must contain only text lines.")
+        value = "\n".join(value)
+    if not isinstance(value, str):
+        raise ConfigError(f"{location} must be text or a list of text lines; use \"\" to leave it empty.")
+    if len(value) > MAX_DAX_LENGTH:
+        raise ConfigError(f"{location} must be at most {MAX_DAX_LENGTH} characters.")
+    return value.strip()
 
 
 def _list(value, location: str) -> list:
@@ -74,6 +92,7 @@ class Question:
     label: str
     question: str
     date_periods: tuple[DatePeriod, ...]
+    dax: str = ""
 
 
 @dataclass(frozen=True)
@@ -84,6 +103,10 @@ class Database:
     database: str
     questions: tuple[Question, ...]
     connection_string_env: str | None = None
+
+    @property
+    def knowledge_base(self) -> tuple[DaxExample, ...]:
+        return tuple(DaxExample(q.question, q.dax) for q in self.questions if q.dax.strip())
 
     def target(self) -> DatabaseTarget:
         server = _expand(self.server, f"database {self.id}.server")
@@ -153,7 +176,7 @@ def load_catalog(path: Path) -> Catalog:
                         _text(period.get("label"), f"{ploc}.label", 100),
                         _text(period.get("value"), f"{ploc}.value", 1000),
                     ))
-            questions.append(Question(label, question, tuple(periods)))
+            questions.append(Question(label, question, tuple(periods), _dax(item.get("dax", ""), f"{qloc}.dax")))
         connection_env = entry.get("connection_string_env")
         if connection_env is not None:
             connection_env = _text(connection_env, f"{loc}.connection_string_env", 100)
