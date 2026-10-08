@@ -2,9 +2,126 @@
   "databases": [
     {
       "id": "main",
-      "name": "My current SSAS database",
+      "name": "SSAS_Retail_Test",
       "server": "${SSAS_SERVER}",
       "database": "${SSAS_DATABASE}",
+      "questions": [
+        {
+          "label": "most sold products",
+          "question": "What are the most sold products?",
+          "dax": "EVALUATE TOPN(10, SUMMARIZECOLUMNS('DimProduct'[Product], 'DimProduct'[Category], \"Quantity Sold\", [Total Quantity], \"Total Sales\", [Total Sales]), [Total Quantity], DESC) ORDER BY [Total Quantity] DESC",
+          "date_periods": [
+            "This month",
+            "Last month",
+            "This year",
+            {
+              "label": "All time",
+              "value": "All available dates; do not apply a date filter."
+            }
+          ]
+        },
+        {
+          "label": "sales by month",
+          "question": "How have sales changed by month?",
+          "dax": "EVALUATE SUMMARIZECOLUMNS('DimDate'[YearMonth], \"Total Sales\", [Total Sales], \"Gross Profit\", [Gross Profit], \"Orders\", [Orders]) ORDER BY 'DimDate'[YearMonth]",
+          "date_periods": [
+            "This year",
+            "Last year",
+            {
+              "label": "All time",
+              "value": "All available dates; do not apply a date filter."
+            }
+          ]
+        },
+        {
+          "label": "sales by category",
+          "question": "Which product categories generate the most sales and profit?",
+          "dax": "EVALUATE SUMMARIZECOLUMNS('DimProduct'[Category], \"Total Sales\", [Total Sales], \"Gross Profit\", [Gross Profit], \"Gross Margin %\", [Gross Margin %], \"Quantity Sold\", [Total Quantity]) ORDER BY [Total Sales] DESC",
+          "date_periods": [
+            "This month",
+            "Last month",
+            "This year",
+            {
+              "label": "All time",
+              "value": "All available dates; do not apply a date filter."
+            }
+          ]
+        },
+        {
+          "label": "top customers",
+          "question": "Who are the top customers by total sales?",
+          "dax": "EVALUATE TOPN(20, SUMMARIZECOLUMNS('DimCustomer'[Customer], 'DimCustomer'[Segment], 'DimCustomer'[Country], 'DimCustomer'[Loyalty Level], \"Total Sales\", [Total Sales], \"Orders\", [Orders]), [Total Sales], DESC) ORDER BY [Total Sales] DESC",
+          "date_periods": [
+            "This month",
+            "Last month",
+            "This year",
+            {
+              "label": "All time",
+              "value": "All available dates; do not apply a date filter."
+            }
+          ]
+        },
+        {
+          "label": "return reasons",
+          "question": "What are the main reasons products are returned?",
+          "dax": "EVALUATE SUMMARIZECOLUMNS('DimReturnReason'[Return Reason], \"Return Transactions\", [Return Transactions], \"Returned Quantity\", [Returned Quantity], \"Return Amount\", [Return Amount]) ORDER BY [Return Transactions] DESC",
+          "date_periods": [
+            "This month",
+            "Last month",
+            "This year",
+            {
+              "label": "All time",
+              "value": "All available dates; do not apply a date filter."
+            }
+          ]
+        },
+        {
+          "label": "returns by category",
+          "question": "Which product categories have the highest return rates?",
+          "dax": "EVALUATE SUMMARIZECOLUMNS('DimProduct'[Category], \"Total Sales\", [Total Sales], \"Return Amount\", [Return Amount], \"Return Rate %\", [Return Rate %], \"Net Sales\", [Net Sales]) ORDER BY [Return Rate %] DESC",
+          "date_periods": [
+            "This month",
+            "Last month",
+            "This year",
+            {
+              "label": "All time",
+              "value": "All available dates; do not apply a date filter."
+            }
+          ]
+        },
+        {
+          "label": "year over year growth",
+          "question": "How is sales performance changing year over year?",
+          "dax": "EVALUATE SUMMARIZECOLUMNS('DimDate'[Year], \"Total Sales\", [Total Sales], \"Previous Year Sales\", [Sales Previous Year], \"YoY Change\", [Sales YoY Change], \"YoY Growth %\", [Sales YoY %]) ORDER BY 'DimDate'[Year]",
+          "date_periods": [
+            {
+              "label": "All time",
+              "value": "All available dates; do not apply a date filter."
+            }
+          ]
+        },
+        {
+          "label": "top brands performance",
+          "question": "Which brands perform best when considering sales, profit, margin, and returns?",
+          "dax": "EVALUATE TOPN(10, SUMMARIZECOLUMNS('DimProduct'[Brand], \"Total Sales\", [Total Sales], \"Gross Profit\", [Gross Profit], \"Gross Margin %\", [Gross Margin %], \"Return Amount\", [Return Amount], \"Return Rate %\", [Return Rate %], \"Net Sales\", [Net Sales]), [Total Sales], DESC) ORDER BY [Total Sales] DESC",
+          "date_periods": [
+            "This month",
+            "Last month",
+            "This year",
+            {
+              "label": "All time",
+              "value": "All available dates; do not apply a date filter."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "second_database",
+      "enabled": true,
+      "name": "Second database - TestModel",
+      "server": "${SECOND_SSAS_SERVER}",
+      "database": "${SECOND_SSAS_DATABASE}",
       "questions": [
         {
           "label": "most sold products",
@@ -17,48 +134,6 @@
             {
               "label": "All time",
               "value": "All available dates; do not apply a date filter."
-            }
-          ]
-        },
-        {
-          "label": "Customers with the highest delivery volume",
-          "question": "Which customers had the highest delivery volume?",
-          "dax": "",
-          "date_periods": [
-            "This month",
-            "Last month",
-            "This year",
-            {
-              "label": "All time",
-              "value": "All available dates; do not apply a date filter."
-            }
-          ]
-        },
-        {
-          "label": "Total delivery volume",
-          "question": "What was the total delivery volume?",
-          "dax": "",
-          "date_periods": ["Today", "Yesterday", "Last 7 days", "Last month"]
-        }
-      ]
-    },
-    {
-      "id": "second_database",
-      "enabled": true,
-      "name": "Second database - edit before enabling",
-      "server": "${SECOND_SSAS_SERVER}",
-      "database": "${SECOND_SSAS_DATABASE}",
-      "questions": [
-        {
-          "label": "Total sales",
-          "question": "What were the total sales?",
-          "dax": "",
-          "date_periods": [
-            "Last month",
-            "This year",
-            {
-              "label": "2026 Q1",
-              "value": "2026-01-01 through 2026-03-31, inclusive"
             }
           ]
         }

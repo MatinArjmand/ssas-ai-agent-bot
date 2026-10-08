@@ -1,4 +1,4 @@
-"""Connect, cache schemas per target, and call the existing Qwen agent."""
+"""Connect, cache schemas per target, and call the configured AI/DAX agent."""
 
 from __future__ import annotations
 

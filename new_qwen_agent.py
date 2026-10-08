@@ -1,27 +1,19 @@
 import os
 import sys
 import json
-import time
+from pathlib import Path
 
 from dotenv import load_dotenv
 from agent_knowledge import format_knowledge_base
+from ai_provider import AIClient, load_ai_settings
 
 
 # =========================================================
 # LOAD CONFIGURATION
 # =========================================================
 
-load_dotenv()
-
-QWEN_API_KEY = os.getenv("QWEN_API_KEY")
-QWEN_BASE_URL = os.getenv(
-    "QWEN_BASE_URL",
-    "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-)
-QWEN_MODEL = os.getenv(
-    "QWEN_MODEL",
-    "qwen3.8-flash"
-)
+load_dotenv(Path(__file__).resolve().parent / ".env")
+AI_SETTINGS = load_ai_settings()
 
 SSAS_SERVER = os.getenv("SSAS_SERVER")
 SSAS_DATABASE = os.getenv("SSAS_DATABASE")
@@ -29,8 +21,6 @@ ADOMD_PATH = os.getenv("ADOMD_PATH")
 
 
 required_settings = {
-    "QWEN_API_KEY": QWEN_API_KEY,
-    "QWEN_BASE_URL": QWEN_BASE_URL,
     "ADOMD_PATH": ADOMD_PATH,
 }
 
@@ -59,17 +49,10 @@ from pyadomd import Pyadomd
 
 
 # =========================================================
-# QWEN / OPENAI-COMPATIBLE CLIENT
+# SELECTED AI PROVIDER
 # =========================================================
 
-from openai import OpenAI
-
-
-client = OpenAI(
-    api_key=QWEN_API_KEY,
-    base_url=QWEN_BASE_URL,
-    timeout=60.0,
-)
+ai_client = AIClient(AI_SETTINGS)
 
 
 # =========================================================
@@ -358,7 +341,7 @@ def get_user_tables(metadata):
 # =========================================================
 # BUILD A TEXT REPRESENTATION OF THE LIVE MODEL
 #
-# This is the schema sent to Qwen.
+# This is the schema sent to the selected AI provider.
 # =========================================================
 
 def build_schema(metadata, database_name=None):
@@ -794,123 +777,17 @@ def metadata_statistics(metadata):
 
 
 # =========================================================
-# QWEN API CALL WITH RETRIES
+# AI API CALL WITH BOUNDED SDK RETRIES
 # =========================================================
 
-def call_qwen(
-    prompt,
-    json_mode=False,
-    max_attempts=5,
-):
 
-    last_error = None
+def call_ai(prompt, json_mode=False, max_attempts=5):
+    return ai_client.complete(prompt, json_mode=json_mode, max_attempts=max_attempts)
 
-    for attempt in range(
-        1,
-        max_attempts + 1
-    ):
 
-        try:
-
-            request = {
-                "model": QWEN_MODEL,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": prompt,
-                    }
-                ],
-                "temperature": 0,
-
-                # We do not need thinking mode for this
-                # application. Disabling it also makes
-                # structured JSON output simpler.
-                "extra_body": {
-                    "enable_thinking": False
-                },
-            }
-
-            if json_mode:
-                request[
-                    "response_format"
-                ] = {
-                    "type": "json_object"
-                }
-
-            response = (
-                client
-                .chat
-                .completions
-                .create(**request)
-            )
-
-            content = (
-                response
-                .choices[0]
-                .message
-                .content
-            )
-
-            if content is None:
-                raise RuntimeError(
-                    "Qwen returned an empty response."
-                )
-
-            return content.strip()
-
-        except Exception as error:
-
-            last_error = error
-
-            status_code = getattr(
-                error,
-                "status_code",
-                None
-            )
-
-            message = str(
-                error
-            ).upper()
-
-            retryable = (
-                status_code
-                in (
-                    429,
-                    500,
-                    502,
-                    503,
-                    504,
-                )
-                or "RATE LIMIT"
-                in message
-                or "TOO MANY REQUESTS"
-                in message
-                or "UNAVAILABLE"
-                in message
-                or "TIMEOUT"
-                in message
-            )
-
-            if (
-                not retryable
-                or attempt == max_attempts
-            ):
-                raise
-
-            delay = min(
-                2 ** (attempt - 1),
-                15
-            )
-
-            print(
-                f"Qwen temporarily unavailable. "
-                f"Retrying in {delay} second(s) "
-                f"({attempt}/{max_attempts})..."
-            )
-
-            time.sleep(delay)
-
-    raise last_error
+# Retain the former entry point for scripts that imported it. It now uses the
+# provider selected by AI_PROVIDER, just like every other agent stage.
+call_qwen = call_ai
 
 
 # =========================================================
@@ -1034,7 +911,7 @@ USER QUESTION:
 {question}
 """
 
-    response_text = call_qwen(
+    response_text = call_ai(
         prompt=prompt,
         json_mode=True,
     )
@@ -1048,19 +925,22 @@ USER QUESTION:
     except json.JSONDecodeError as error:
 
         raise RuntimeError(
-            "Qwen returned invalid JSON:\n"
+            f"{AI_SETTINGS.provider} returned invalid JSON:\n"
             + response_text
         ) from error
 
+    if not isinstance(result, dict):
+        raise RuntimeError(f"{AI_SETTINGS.provider} must return a JSON object with a dax field.")
+
     dax = result.get("dax")
 
-    if not dax:
+    if not isinstance(dax, str) or not dax.strip():
         raise RuntimeError(
-            "Qwen returned JSON but "
+            f"{AI_SETTINGS.provider} returned JSON but "
             "did not include a 'dax' field."
         )
 
-    return str(dax).strip()
+    return dax.strip()
 
 
 # =========================================================
@@ -1187,7 +1067,7 @@ RULES:
   unless the user specifically asks about them.
 """
 
-    return call_qwen(
+    return call_ai(
         prompt=prompt,
         json_mode=False,
     )
@@ -1397,7 +1277,7 @@ Required JSON format:
 }}
 """
 
-    response_text = call_qwen(
+    response_text = call_ai(
         prompt=prompt,
         json_mode=True,
     )
@@ -1410,18 +1290,21 @@ Required JSON format:
     except json.JSONDecodeError as error:
 
         raise RuntimeError(
-            "Qwen returned invalid JSON while repairing DAX:\n"
+            f"{AI_SETTINGS.provider} returned invalid JSON while repairing DAX:\n"
             + response_text
         ) from error
 
+    if not isinstance(result, dict):
+        raise RuntimeError(f"{AI_SETTINGS.provider} must return a JSON object with a dax field.")
+
     dax = result.get("dax")
 
-    if not dax:
+    if not isinstance(dax, str) or not dax.strip():
         raise RuntimeError(
-            "Qwen did not return a repaired 'dax' field."
+            f"{AI_SETTINGS.provider} did not return a repaired 'dax' field."
         )
 
-    return str(dax).strip()
+    return dax.strip()
 
 
 # =========================================================
@@ -1491,7 +1374,7 @@ def generate_and_execute_dax(
             )
 
             print(
-                "Qwen produced a repaired query.\n"
+                f"{AI_SETTINGS.provider} produced a repaired query.\n"
             )
 
 
@@ -1502,7 +1385,7 @@ def generate_and_execute_dax(
 if __name__ == "__main__":
 
     print("=" * 70)
-    print("SSAS AI Agent - Qwen")
+    print(f"SSAS AI Agent - {AI_SETTINGS.provider}")
     print("=" * 70)
 
     print(
@@ -1514,11 +1397,11 @@ if __name__ == "__main__":
     )
 
     print(
-        f"AI model:  {QWEN_MODEL}"
+        f"AI model:  {AI_SETTINGS.model}"
     )
 
     print(
-        f"Qwen URL:  {QWEN_BASE_URL}"
+        f"Provider:  {AI_SETTINGS.provider}"
     )
 
     print()
@@ -1625,7 +1508,7 @@ if __name__ == "__main__":
             continue
 
         # -------------------------------------------------
-        # ASK QWEN
+        # ASK THE SELECTED AI PROVIDER
         # -------------------------------------------------
 
         try:

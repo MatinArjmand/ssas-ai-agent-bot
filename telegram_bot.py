@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from agent_service import AgentService
+from ai_provider import load_ai_settings
 from bot_config import load_catalog
 from bot_flow import BotFlow, Session
 from email_auth import AuthStore, load_allowed_emails
@@ -225,7 +226,7 @@ async def post_init(application):
         BotCommand("start", "Register or choose a database"),
         BotCommand("selectdatabase", "Choose or change database"),
         BotCommand("questions", "Show recommended questions"),
-        BotCommand("cancel", "Cancel signup or the current selections"),
+        BotCommand("cancel", "Cancel signup or the current selection"),
         BotCommand("reloadschema", "Refresh selected database schema"),
         BotCommand("whoami", "Show linked email and Telegram identity"),
         BotCommand("help", "Show instructions"),
@@ -246,6 +247,9 @@ def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("Add TELEGRAM_BOT_TOKEN to the .env file next to telegram_bot.py.")
+    # Fail before polling when the selected AI provider is not configured.
+    # This validates settings only; it sends no API request and loads no SSAS driver.
+    ai_settings = load_ai_settings()
     email_file = config_path("TELEGRAM_ALLOWED_EMAILS_FILE", "allowed_emails.txt")
     account_file = config_path("TELEGRAM_AUTH_DB_FILE", "data/bot_auth.sqlite3")
     auth_store = AuthStore(account_file, email_file)
@@ -254,6 +258,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logger.info("AI provider: %s | model: %s", ai_settings.provider, ai_settings.model)
     if not load_allowed_emails(email_file):
         logger.warning("The email allowlist is empty. Add approved addresses to %s before signup.", email_file)
     application = Application.builder().token(token).concurrent_updates(False).post_init(post_init).build()
